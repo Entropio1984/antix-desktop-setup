@@ -125,6 +125,9 @@ backup_file() {
     local bak
     if [ -f "$1" ]; then
         bak="$1.bak.$(date +%Y%m%d_%H%M%S)"
+        # Si en el mismo segundo ya se respaldo este archivo, se conserva esa
+        # copia (la mas antigua) y no una intermedia.
+        [ -e "$bak" ] && return 0
         cp -a "$1" "$bak"
         log_info "Respaldo creado: $bak"
     fi
@@ -826,11 +829,8 @@ choose_desktop() {
         log_error "No hay una terminal interactiva: indica el escritorio con --lxde, --lxqt o --fluxbox."
         exit 1
     fi
-    # El menu se muestra antes de tocar apt. Si falta "dialog", se intenta
-    # instalarlo en silencio; si no se puede (sin internet), se usa el menu
-    # de texto.
-    command -v dialog >/dev/null 2>&1 || apt_get_install dialog \
-        || log_info "Sin 'dialog': se usa el menu de texto."
+    # El menu se muestra antes de tocar apt: si no esta "dialog", no se
+    # instala (eso ya cambiaria el sistema), se usa el menu de texto.
 
     if has_sse2; then
         lxqt_text="LXQt: moderno (Qt), necesita algo mas de memoria"
@@ -1140,6 +1140,7 @@ setup_youtube() {
     fi
     # Se actualiza solo cada semana (anacron lo hace aunque el equipo no
     # este encendido justo ese dia).
+    mkdir -p /etc/cron.weekly
     if [ -d /etc/cron.weekly ]; then
         printf '#!/bin/sh\n# antix-desktop-postinstall: mantener yt-dlp al dia (YouTube cambia seguido).\n[ -x /usr/local/bin/yt-dlp ] && /usr/local/bin/yt-dlp -U >/dev/null 2>&1\ntrue\n' \
             > /etc/cron.weekly/antix-yt-dlp
@@ -1349,7 +1350,9 @@ BOOT
         [ "$(cat "$q/rotational" 2>/dev/null)" = 0 ] || continue
         [ "$(cat "$q/discard_max_bytes" 2>/dev/null || echo 0)" != 0 ] && ssd="$ssd $dev"
     done
-    if [ -n "$ssd" ] && [ -d /etc/cron.weekly ]; then
+    # La carpeta se crea aunque cron todavia no este instalado (se instala
+    # despues, en ensure_scheduler).
+    if [ -n "$ssd" ] && mkdir -p /etc/cron.weekly; then
         printf '#!/bin/sh\n# antix-desktop-postinstall: TRIM semanal de los SSD.\nfstrim -a >/dev/null 2>&1 || true\n' \
             > /etc/cron.weekly/antix-fstrim
         chmod 755 /etc/cron.weekly/antix-fstrim
@@ -1384,17 +1387,37 @@ ensure_scheduler() {
     fi
     if command -v cron >/dev/null 2>&1; then
         ensure_runit_service cron "$(command -v cron) -f" no
+        setup_anacron_cron
     else
         log_warn "No hay cron: las tareas semanales (yt-dlp, TRIM) no se ejecutaran."
     fi
+}
+
+# Debian arranca anacron al encender con un script de init y, ademas, cada
+# hora entre 7:30 y 23:30 por medio de invoke-rc.d. Bajo runit ninguno de
+# los dos es seguro, asi que cron lo llama directamente: 5 minutos despues
+# de encender y luego cada hora. anacron recuerda que ya hizo y no repite.
+ANACRON_CRON=/etc/cron.d/antix-anacron
+setup_anacron_cron() {
+    [ -x /usr/sbin/anacron ] || return 0
+    [ -f "$ANACRON_CRON" ] && return 0
+    printf '%s\n' \
+        '# antix-desktop-postinstall: bajo runit nadie arranca anacron al encender.' \
+        'SHELL=/bin/sh' \
+        'PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin' \
+        '@reboot root sleep 300 && /usr/sbin/anacron -s' \
+        '45 * * * * root /usr/sbin/anacron -s' > "$ANACRON_CRON"
+    chmod 644 "$ANACRON_CRON"
+    log_ok "anacron se ejecuta al encender y cada hora: $ANACRON_CRON"
 }
 
 # En --limpiar (sin internet) solo se avisa.
 check_scheduler() {
     if ! command -v cron >/dev/null 2>&1; then
         log_warn "No hay cron: las tareas semanales (TRIM) no se ejecutaran. Con internet: sudo apt install cron anacron"
-    elif [ ! -e "$SERVICE_DIR/$(runit_name cron)" ]; then
-        ensure_runit_service cron "$(command -v cron) -f" no
+    else
+        [ -e "$SERVICE_DIR/$(runit_name cron)" ] || ensure_runit_service cron "$(command -v cron) -f" no
+        setup_anacron_cron
     fi
 }
 
@@ -1701,12 +1724,9 @@ setup_user() {
     # La version vieja escribia "exec startlxde" en ~/.xsessionrc, lo que
     # forzaba LXDE sin importar lo que se eligiera en LightDM.
     rc="$TARGET_HOME/.xsessionrc"
-    if [ -f "$rc" ] && grep -qx 'exec startlxde' "$rc"; then
-        backup_file "$rc"
-        sed -i '/^exec startlxde$/d' "$rc"
-        [ -s "$rc" ] || rm -f "$rc"
-        log_ok "Retirado 'exec startlxde' de $rc"
-    fi
+    # remove_line conserva el dueno del archivo (el usuario).
+    remove_line "$rc" 'exec startlxde'
+    [ -f "$rc" ] && [ ! -s "$rc" ] && rm -f "$rc"
 }
 
 # ------------------------------------------------------------------------------
