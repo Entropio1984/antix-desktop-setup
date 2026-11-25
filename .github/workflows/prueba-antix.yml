@@ -222,6 +222,18 @@ jobs:
           sudo grep -iE "unknown|invalid|error|warning" /antix/tmp/tint2.log || echo "tint2 no reporto problemas en su configuracion"
           echo "OK"
 
+      - name: LXQt (volumen con ALSA, botones Apagar y Reiniciar)
+        if: matrix.escritorio == 'lxqt'
+        run: |
+          sudo chroot /antix env ANTIX_SOLO_FUNCIONES=1 bash -c '. /root/antix-desktop-postinstall.sh; LOG_FILE=/tmp/lxqt.log; DESKTOP=LXQT; TARGET_HOME=""; TARGET_USER=""; setup_desktop_config'
+          sudo cat /antix/tmp/lxqt.log
+          sudo chroot /antix dpkg -L lxqt-panel | grep -E "panel\.conf$" || true
+          echo "--- panel.conf de /etc/skel:"; sudo cat /antix/etc/skel/.config/lxqt/panel.conf
+          sudo grep -qx 'audioEngine=Alsa' /antix/etc/skel/.config/lxqt/panel.conf || { echo "::error::El volumen de LXQt no quedo con ALSA"; exit 1; }
+          echo "--- Apagar/Reiniciar:"; sudo cat /antix/usr/local/bin/antix-salir /antix/etc/sudoers.d/antix-apagar /antix/etc/skel/.config/lxqt/power.conf
+          sudo chroot /antix visudo -c
+          sudo grep -q 'shutdownCommand=/usr/local/bin/antix-salir apagar' /antix/etc/skel/.config/lxqt/power.conf || { echo "::error::LXQt sin boton de apagar"; exit 1; }
+
   # antiX Full de 32 bits: la limpieza que deja IceWM (--limpiar). Corre
   # SIN red (unshare -n) para demostrar que no descarga nada, con el
   # sistema en espanol (es_CO), como lo instalaria una persona en Colombia.
