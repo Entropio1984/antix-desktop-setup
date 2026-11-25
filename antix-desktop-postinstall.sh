@@ -240,6 +240,9 @@ ensure_runit_service() {
 # (el archivo solo tenia esa): eso tambien es un exito.
 remove_line() {
     local file="$1" line="$2" tmp rc=0
+    # Un enlace (por ejemplo en la carpeta del usuario) no se sigue: root
+    # terminaria escribiendo en el archivo al que apunta.
+    [ -L "$file" ] && { log_warn "$file es un enlace: no se modifica."; return 0; }
     [ -f "$file" ] || return 0
     if grep -qxF -- "$line" "$file"; then
         backup_file "$file"
@@ -894,6 +897,13 @@ choose_desktop() {
                 3) if has_sse2; then DESKTOP="LXQT"; break; else echo "LXQt no funciona en este procesador (sin SSE2)."; fi ;;
             esac
         done
+        # Igual que en el menu grafico: confirmar antes de cambiar nada.
+        printf 'Se va a usar %s. A partir de aqui el script no hara mas preguntas.\nComenzar? (s/n): ' "$DESKTOP"
+        read -r r || exit 1
+        case "$r" in
+            s|S|si|SI|Si|y|Y) ;;
+            *) log_info "Cancelado por el usuario: no se cambio la configuracion del sistema."; exit 0 ;;
+        esac
     fi
     log_ok "Escritorio elegido: $DESKTOP"
 }
@@ -1140,7 +1150,7 @@ setup_youtube() {
     fi
     # Se actualiza solo cada semana (anacron lo hace aunque el equipo no
     # este encendido justo ese dia).
-    mkdir -p /etc/cron.weekly
+    [ -d /etc/cron.weekly ] || install -d -m 755 -o root -g root /etc/cron.weekly
     if [ -d /etc/cron.weekly ]; then
         printf '#!/bin/sh\n# antix-desktop-postinstall: mantener yt-dlp al dia (YouTube cambia seguido).\n[ -x /usr/local/bin/yt-dlp ] && /usr/local/bin/yt-dlp -U >/dev/null 2>&1\ntrue\n' \
             > /etc/cron.weekly/antix-yt-dlp
@@ -1352,7 +1362,7 @@ BOOT
     done
     # La carpeta se crea aunque cron todavia no este instalado (se instala
     # despues, en ensure_scheduler).
-    if [ -n "$ssd" ] && mkdir -p /etc/cron.weekly; then
+    if [ -n "$ssd" ] && { [ -d /etc/cron.weekly ] || install -d -m 755 -o root -g root /etc/cron.weekly; }; then
         printf '#!/bin/sh\n# antix-desktop-postinstall: TRIM semanal de los SSD.\nfstrim -a >/dev/null 2>&1 || true\n' \
             > /etc/cron.weekly/antix-fstrim
         chmod 755 /etc/cron.weekly/antix-fstrim
@@ -1400,13 +1410,17 @@ ensure_scheduler() {
 ANACRON_CRON=/etc/cron.d/antix-anacron
 setup_anacron_cron() {
     [ -x /usr/sbin/anacron ] || return 0
-    [ -f "$ANACRON_CRON" ] && return 0
-    printf '%s\n' \
+    [ -s "$ANACRON_CRON" ] && return 0
+    if ! printf '%s\n' \
         '# antix-desktop-postinstall: bajo runit nadie arranca anacron al encender.' \
         'SHELL=/bin/sh' \
         'PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin' \
         '@reboot root sleep 300 && /usr/sbin/anacron -s' \
-        '45 * * * * root /usr/sbin/anacron -s' > "$ANACRON_CRON"
+        '45 * * * * root /usr/sbin/anacron -s' > "$ANACRON_CRON"; then
+        rm -f "$ANACRON_CRON"
+        log_warn "No se pudo escribir $ANACRON_CRON: anacron solo correra cuando lo llame Debian."
+        return 0
+    fi
     chmod 644 "$ANACRON_CRON"
     log_ok "anacron se ejecuta al encender y cada hora: $ANACRON_CRON"
 }
@@ -1417,7 +1431,11 @@ check_scheduler() {
         log_warn "No hay cron: las tareas semanales (TRIM) no se ejecutaran. Con internet: sudo apt install cron anacron"
     else
         [ -e "$SERVICE_DIR/$(runit_name cron)" ] || ensure_runit_service cron "$(command -v cron) -f" no
-        setup_anacron_cron
+        if [ -x /usr/sbin/anacron ]; then
+            setup_anacron_cron
+        else
+            log_warn "No hay anacron: las tareas semanales solo corren si el equipo esta encendido el domingo temprano. Con internet: sudo apt install anacron"
+        fi
     fi
 }
 
