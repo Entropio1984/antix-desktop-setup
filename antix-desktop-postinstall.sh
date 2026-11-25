@@ -56,11 +56,19 @@ MIRRORS=1
 MIRROR_BACKUP_DIR="/var/backups/antix-desktop-espejos"
 TARGET_USER=""
 TARGET_HOME=""
+MIRRORS_UPDATED=0
+# Carpeta para archivos temporales: se borra al terminar, aunque se
+# interrumpa el script con Ctrl+C.
+WORK_DIR=""
+# Opciones de apt para instalar sin preguntas: si un archivo de
+# configuracion fue modificado, se conserva el del usuario en vez de
+# quedarse esperando una respuesta que nadie ve (la salida va al log).
+APT_INSTALL_OPTS="-y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
 # ------------------------------------------------------------------------------
 # Listas de paquetes (se instalan sin los "recomendados" para no sumar peso)
 # ------------------------------------------------------------------------------
-PKGS_BASE="xorg dbus-x11 consolekit polkitd adwaita-icon-theme alsa-utils
+PKGS_BASE="xorg dbus-x11 curl consolekit polkitd adwaita-icon-theme alsa-utils
  network-manager network-manager-gnome lightdm lightdm-gtk-greeter
  runit-service-network-manager runit-service-consolekit
  gvfs gvfs-backends udisks2 ntfs-3g exfatprogs"
@@ -114,24 +122,50 @@ has_sse2() {
 }
 
 backup_file() {
+    local bak
     if [ -f "$1" ]; then
-        cp -a "$1" "$1.bak.$(date +%Y%m%d_%H%M%S)"
-        log_info "Respaldo creado: $1.bak.*"
+        bak="$1.bak.$(date +%Y%m%d_%H%M%S)"
+        cp -a "$1" "$bak"
+        log_info "Respaldo creado: $bak"
     fi
+}
+
+# Archivo temporal dentro de la carpeta de trabajo del script.
+make_temp() {
+    mktemp ${1:+"$1"} -p "${WORK_DIR:-${TMPDIR:-/tmp}}"
 }
 
 # Instala en una sola transaccion; si falla (por ejemplo, porque un nombre
 # no existe), reintenta paquete por paquete para que un solo fallo no
 # impida instalar el resto. La salida de apt va al log.
+# Si en el lote hay nombres que apt no conoce, primero se reintenta el lote
+# sin ellos: es mucho mas rapido que ir de a uno (cada instalacion repite
+# los "triggers" de dpkg, lentos en discos mecanicos).
+apt_get_install() {
+    # shellcheck disable=SC2086
+    DEBIAN_FRONTEND=noninteractive apt-get install $APT_INSTALL_OPTS "$@" >>"$LOG_FILE" 2>&1
+}
+
 apt_install() {
+    local p known="" unknown=""
     log_info "Instalando: $* (puede tardar varios minutos)"
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >>"$LOG_FILE" 2>&1; then
+    if apt_get_install "$@"; then
         log_ok "Instalado."
         return 0
     fi
-    log_warn "Fallo la instalacion en lote; se reintenta paquete por paquete."
     for p in "$@"; do
-        if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$p" >>"$LOG_FILE" 2>&1; then
+        if apt-cache show "$p" >/dev/null 2>&1; then known="$known $p"; else unknown="$unknown $p"; fi
+    done
+    # shellcheck disable=SC2086
+    if [ -n "$unknown" ] && [ -n "$known" ] && apt_get_install $known; then
+        log_ok "Instalado, salvo lo que apt no conoce:$unknown"
+        # shellcheck disable=SC2086
+        set -- $unknown
+    else
+        log_warn "Fallo la instalacion en lote; se reintenta paquete por paquete."
+    fi
+    for p in "$@"; do
+        if apt_get_install "$p"; then
             log_ok "'$p' instalado."
         else
             log_warn "No se pudo instalar '$p' (detalle en $LOG_FILE)."
@@ -177,11 +211,17 @@ ensure_runit_service() {
     for c in $cands; do
         [ "$c" = "$name" ] && continue
         if [ -L "$SERVICE_DIR/$c" ]; then
-            sv down "$SERVICE_DIR/$c" >/dev/null 2>&1
+            # Se espera (hasta 10 s) a que el programa termine de verdad
+            # antes de arrancar el otro.
+            sv -w 10 force-stop "$SERVICE_DIR/$c" >/dev/null 2>&1
             rm -f "$SERVICE_DIR/$c"
             log_ok "Servicio duplicado '$c' desactivado (se usa '$name')."
         fi
     done
+    # Un enlace roto (apunta a una carpeta que ya no existe) se reemplaza.
+    if [ -L "$SERVICE_DIR/$name" ] && [ ! -e "$SERVICE_DIR/$name" ]; then
+        rm -f "$SERVICE_DIR/$name"
+    fi
     if [ ! -e "$SERVICE_DIR/$name" ]; then
         ln -s "$SV_DIR/$name" "$SERVICE_DIR/$name"
         log_ok "Servicio '$name' activado."
@@ -191,14 +231,24 @@ ensure_runit_service() {
 }
 
 # Retira una linea exacta de un archivo, si esta.
+# El temporal va en la carpeta de trabajo del script (de root), no junto al
+# archivo: la carpeta del usuario no es un lugar seguro para que root
+# escriba un nombre fijo. grep devuelve 1 cuando no queda ninguna linea
+# (el archivo solo tenia esa): eso tambien es un exito.
 remove_line() {
-    file="$1"; line="$2"
+    local file="$1" line="$2" tmp rc=0
     [ -f "$file" ] || return 0
-    if grep -qxF "$line" "$file"; then
+    if grep -qxF -- "$line" "$file"; then
         backup_file "$file"
-        grep -vxF "$line" "$file" > "$file.tmp" && cat "$file.tmp" > "$file"
-        rm -f "$file.tmp"
-        log_ok "Retirado '$line' de $file"
+        tmp="$(make_temp)" || return 1
+        grep -vxF -- "$line" "$file" > "$tmp" || rc=$?
+        if [ "$rc" -le 1 ]; then
+            cat "$tmp" > "$file"
+            log_ok "Retirado '$line' de $file"
+        else
+            log_warn "No se pudo quitar '$line' de $file"
+        fi
+        rm -f "$tmp"
     fi
 }
 
@@ -222,7 +272,7 @@ parse_args() {
                     inits) echo "$INIT_PKG_REGEX"; exit 0 ;;
                     *) echo "Uso: --listar lxde|lxqt|fluxbox|inits" >&2; exit 1 ;;
                 esac ;;
-            -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            -h|--help) awk 'NR > 2 && /^# =+$/ { exit } NR > 2 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
             *) echo "Opcion desconocida: $1 (usa --help)" >&2; exit 1 ;;
         esac
         shift
@@ -234,7 +284,9 @@ check_environment() {
         echo "Este script debe ejecutarse como root: sudo $0" >&2
         exit 1
     fi
-    : >>"$LOG_FILE"
+    # El registro solo lo lee root (y el grupo adm), como los de /var/log.
+    [ -e "$LOG_FILE" ] || install -m 640 -g adm /dev/null "$LOG_FILE" 2>/dev/null \
+        || install -m 640 /dev/null "$LOG_FILE"
     log_file "===== Inicio de ejecucion ====="
 
     if mountpoint -q /live/aufs 2>/dev/null; then
@@ -242,7 +294,8 @@ check_environment() {
         exit 1
     fi
 
-    init_name="$(ps -p 1 -o comm= 2>/dev/null)"
+    init_name=""
+    read -r init_name </proc/1/comm 2>/dev/null || init_name="$(ps -p 1 -o comm= 2>/dev/null)"
     if [ "$init_name" != "runit" ]; then
         log_error "Este script esta hecho para antiX con init runit (el predeterminado); el init activo es '$init_name'."
         log_error "Reinicia eligiendo runit en el menu de arranque y vuelve a ejecutarlo."
@@ -262,7 +315,12 @@ check_environment() {
         TARGET_USER=""
     else
         TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
-        log_ok "Usuario detectado: $TARGET_USER ($TARGET_HOME)"
+        if [ -z "$TARGET_HOME" ] || [ "$TARGET_HOME" = "/" ] || [ ! -d "$TARGET_HOME" ]; then
+            log_warn "El usuario $TARGET_USER no tiene carpeta personal: solo se configuran los usuarios nuevos."
+            TARGET_USER=""; TARGET_HOME=""
+        else
+            log_ok "Usuario detectado: $TARGET_USER ($TARGET_HOME)"
+        fi
     fi
 }
 
@@ -306,17 +364,25 @@ apt_source_files() {
     done
 }
 
-# Segundos que tarda en bajar el URL $1 (vacio si falla).
+# Segundos que tarda en bajar el URL $1 (vacio si falla). Sigue las
+# redirecciones (-L). Con un error (404, 503...) no imprime nada: un espejo
+# caido que contesta rapido "no existe" no debe parecer el mejor.
+# LC_ALL=C en todas las cuentas: en espanol el decimal es una coma y
+# "sort -n" ordenaria mal "0.25".
 mirror_latency() {
-    curl -fsS -o /dev/null --connect-timeout 3 --max-time 6 -w '%{time_total}' "$1" 2>/dev/null
+    local out
+    if out="$(LC_ALL=C curl -fsSL -o /dev/null --connect-timeout 3 --max-time 6 -w '%{time_total}' "$1" 2>/dev/null)"; then
+        printf '%s\n' "$out"
+    fi
 }
 
 # Velocidad en KB/s bajando hasta 2 MB del URL $1 en 8 s como maximo.
 mirror_speed() {
-    v="$(curl -sS -o /dev/null -r 0-2097151 --connect-timeout 4 --max-time 8 \
+    local v
+    v="$(LC_ALL=C curl -sSL -o /dev/null -r 0-2097151 --connect-timeout 4 --max-time 8 \
             -w '%{http_code} %{speed_download}' "$1" 2>/dev/null)"
     case "$v" in
-        200\ *|206\ *) echo "${v#* }" | awk '{ printf "%d", $1 / 1024 }' ;;
+        200\ *|206\ *) echo "${v#* }" | LC_ALL=C awk '{ printf "%d", $1 / 1024 }' ;;
         *) echo 0 ;;
     esac
 }
@@ -325,19 +391,19 @@ mirror_speed() {
 # $1 = modo: "latencia" (solo tiempo de respuesta) o "velocidad".
 # Imprime "BASE VALOR" del mejor (VALOR en s o en KB/s), o nada.
 pick_mirror() {
-    modo="$1"
-    tmp="$(mktemp)"
+    local modo="$1" tmp
+    tmp="$(make_temp)"
     while read -r base url; do
         [ -n "$base" ] || continue
         ( t="$(mirror_latency "$url")" && [ -n "$t" ] && echo "$t $base $url" >>"$tmp" ) &
     done
     wait
     if [ "$modo" = "latencia" ]; then
-        sort -n "$tmp" | awk 'NR==1 { print $2, $1 }'
+        LC_ALL=C sort -n "$tmp" | awk 'NR==1 { print $2, $1 }'
     else
-        sort -n "$tmp" | head -n 4 | while read -r _t base url; do
+        LC_ALL=C sort -n "$tmp" | head -n 4 | while read -r _t base url; do
             echo "$(mirror_speed "$url") $base"
-        done | sort -rn | awk '$1 > 0 { print $2, $1; exit }'
+        done | LC_ALL=C sort -rn | awk '$1 > 0 { print $2, $1; exit }'
     fi
     rm -f "$tmp"
 }
@@ -348,7 +414,7 @@ replace_apt_url() {
     old_re="$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')"
     for f in $(apt_source_files); do
         grep -qE "^deb[[:space:]](.*[[:space:]])?$old_re/?[[:space:]]" "$f" || continue
-        sed -i -E "/^deb /s#([[:space:]])$old_re/?([[:space:]])#\\1$2\\2#" "$f"
+        sed -i -E "/^deb[[:space:]]/s#([[:space:]])$old_re/?([[:space:]])#\\1$2\\2#" "$f"
     done
 }
 
@@ -385,8 +451,11 @@ EOF_DEB
             zona="$(/usr/sbin/localize-repo -c default 2>/dev/null | awk '/Deb code:/ { print $3 }')"
             [ -n "$zona" ] && codes="$zona $codes"
         fi
-        cands="$deb_cur http://deb.debian.org/debian"
-        for c in $codes; do cands="$cands http://ftp.$c.debian.org/debian"; done
+        # Si el sistema ya usaba https, los candidatos tambien (no se baja
+        # a http).
+        scheme="${deb_cur%%://*}"
+        cands="$deb_cur $scheme://deb.debian.org/debian"
+        for c in $codes; do cands="$cands $scheme://ftp.$c.debian.org/debian"; done
         best="$(for b in $(echo $cands | tr ' ' '\n' | awk '!v[$0]++'); do
                     echo "$b $b/dists/$deb_suite/main/binary-$arch/Packages.xz"
                 done | pick_mirror velocidad)"
@@ -426,7 +495,7 @@ EOF_AX
         if [ -z "$best" ]; then
             log_warn "No se pudo medir ningun espejo de antiX: se deja $ax_cur."
         elif [ "$best_base" != "$ax_cur_base" ] && \
-             { [ -z "$cur_t" ] || awk -v n="$best_t" -v a="$cur_t" 'BEGIN { exit !(n < a * 0.8) }'; }; then
+             { [ -z "$cur_t" ] || LC_ALL=C awk -v n="$best_t" -v a="$cur_t" 'BEGIN { exit !(n < a * 0.8) }'; }; then
             log_ok "antiX: $best_base/$ax_suite (${best_t} s) en lugar de $ax_cur (${cur_t:-sin respuesta} s)."
             replace_apt_url "$ax_cur" "$best_base/$ax_suite"
             changed=1
@@ -441,8 +510,11 @@ EOF_AX
 
     [ "$changed" = 1 ] || return 0
     log_info "Comprobando los espejos nuevos..."
-    if apt-get update >"$MIRROR_BACKUP_DIR/update.log" 2>&1 \
+    # En ingles (LC_ALL=C) para poder reconocer los errores: en espanol
+    # "W: Failed" dice "W: Fallo al obtener".
+    if LC_ALL=C apt-get update >"$MIRROR_BACKUP_DIR/update.log" 2>&1 \
        && ! grep -qE '^(E:|Err:|W: Failed)' "$MIRROR_BACKUP_DIR/update.log"; then
+        MIRRORS_UPDATED=1
         log_ok "Espejos nuevos funcionando. Copia de los anteriores en $MIRROR_BACKUP_DIR."
     else
         cat "$MIRROR_BACKUP_DIR/update.log" >>"$LOG_FILE"
@@ -510,7 +582,7 @@ is_antix_full() {
 
 # Idioma del sistema (es, pt, en...) segun /etc/default/locale.
 system_language() {
-    l="$(sed -n 's/^LANG=//p' /etc/default/locale 2>/dev/null | tr -d '"' | head -n1)"
+    l="$(sed -n 's/^LANG=//p' /etc/default/locale 2>/dev/null | tr -d "\"'" | head -n1)"
     [ -n "$l" ] || l="${LANG:-en_US.UTF-8}"
     echo "$l"
 }
@@ -532,7 +604,13 @@ reduce_locales() {
     is_installed locales-all || return 0
     is_installed locales || { log_warn "Falta el paquete 'locales': se deja locales-all."; return 0; }
     loc="$(system_language)"
-    case "$loc" in *.UTF-8|*.utf8) ;; *) loc="${loc%%.*}.UTF-8" ;; esac
+    # "es_CO.utf8" se escribe "es_CO.UTF-8" en /etc/locale.gen; "C" y
+    # "POSIX" no son idiomas que se generen: queda solo el ingles.
+    case "$loc" in
+        C|C.*|POSIX) loc=en_US.UTF-8 ;;
+        *.UTF-8) ;;
+        *) loc="${loc%%.*}.UTF-8" ;;
+    esac
     backup_file /etc/locale.gen
     for l in "$loc" en_US.UTF-8; do
         if grep -q "^# *$l UTF-8" /etc/locale.gen 2>/dev/null; then
@@ -562,8 +640,13 @@ purge_group() {
     pkgs=""
     for p in "$@"; do is_installed "$p" && pkgs="$pkgs $p"; done
     [ -n "$pkgs" ] || { log_ok "$title: nada que quitar."; return 0; }
+    # Si la simulacion misma falla, no se sabe que se iria: no se toca nada.
     # shellcheck disable=SC2086
-    bad="$(apt-get -s purge $pkgs 2>/dev/null | awk '/^(Remv|Purg) /{print $2}' \
+    if ! sim="$(LC_ALL=C apt-get -s purge $pkgs 2>>"$LOG_FILE")"; then
+        log_warn "$title: apt no pudo simular la operacion; no se quita nada (detalle en $LOG_FILE)."
+        return 0
+    fi
+    bad="$(printf '%s\n' "$sim" | awk '/^(Remv|Purg) /{print $2}' \
            | sed 's/:.*//' | grep -E "$CLEAN_PROTECTED" || true)"
     if [ -n "$bad" ]; then
         log_warn "$title: no se quita nada porque tambien se iria: $(echo $bad)"
@@ -593,7 +676,8 @@ fix_menu_links() {
 #!/bin/sh
 # antix-desktop-postinstall --limpiar: abre la ayuda de antiX en Firefox.
 [ -x /usr/bin/antix-viewer ] && exec /usr/bin/antix-viewer "$@"
-exec firefox-esr "$1"
+[ -n "${1:-}" ] && exec firefox-esr "$1"
+exec firefox-esr
 VIEWER
         chmod 755 /usr/local/bin/antix-viewer
         log_ok "La ayuda de antiX se abre ahora con Firefox."
@@ -616,7 +700,7 @@ VIEWER
         fi
         # Accesos que antiX trae para programas que no vienen instalados
         # (por ejemplo GIMP).
-        e="$(sed -n 's/^Exec=//p' "$f" | head -n1)"; e="${e%% *}"
+        e="$(sed -n 's/^Exec=//p' "$f" | head -n1)"; e="${e#\"}"; e="${e%% *}"; e="${e%\"}"
         if [ -n "$e" ] && ! command -v "$e" >/dev/null 2>&1; then
             rm -f "$f"
             n=$((n + 1))
@@ -676,7 +760,7 @@ clean_antix_full() {
         log_error "En antiX Core usa --lxde, --lxqt o --fluxbox."
         exit 1
     fi
-    before=$(df -m / | awk 'NR==2{print $3}')
+    before=$(df -Pm / | awk 'NR==2{print $3}')
 
     # shellcheck disable=SC2086
     purge_group "Otros escritorios (Fluxbox, JWM, herbstluftwm)" $CLEAN_DESKTOPS
@@ -702,13 +786,25 @@ clean_antix_full() {
 
     # Paquetes que quedaron sin uso; la cache de apt en antiX Full suele
     # estar vacia, pero por si acaso.
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >>"$LOG_FILE" 2>&1 \
-        || log_warn "apt-get autoremove dio un error (detalle en $LOG_FILE)."
+    # Tambien se simula antes: si se fuera algo de la lista protegida (por
+    # ejemplo, un programa que quedo marcado como "dependencia"), no se hace.
+    if ! sim="$(LC_ALL=C apt-get -s autoremove --purge 2>>"$LOG_FILE")"; then
+        log_warn "apt no pudo simular 'autoremove': se omite."
+    else
+        bad="$(printf '%s\n' "$sim" | awk '/^(Remv|Purg) /{print $2}' \
+               | sed 's/:.*//' | grep -E "$CLEAN_PROTECTED" || true)"
+        if [ -n "$bad" ]; then
+            log_warn "No se hace 'autoremove' porque tambien se iria: $(echo $bad)"
+        else
+            DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >>"$LOG_FILE" 2>&1 \
+                || log_warn "apt-get autoremove dio un error (detalle en $LOG_FILE)."
+        fi
+    fi
     apt-get clean >/dev/null 2>&1
 
     fix_menu_links
 
-    after=$(df -m / | awk 'NR==2{print $3}')
+    after=$(df -Pm / | awk 'NR==2{print $3}')
     log_ok "Espacio liberado: $((before - after)) MB (usado ahora: $after MB)."
 }
 
@@ -730,7 +826,11 @@ choose_desktop() {
         log_error "No hay una terminal interactiva: indica el escritorio con --lxde, --lxqt o --fluxbox."
         exit 1
     fi
-    command -v dialog >/dev/null 2>&1 || apt_install dialog
+    # El menu se muestra antes de tocar apt. Si falta "dialog", se intenta
+    # instalarlo en silencio; si no se puede (sin internet), se usa el menu
+    # de texto.
+    command -v dialog >/dev/null 2>&1 || apt_get_install dialog \
+        || log_info "Sin 'dialog': se usa el menu de texto."
 
     if has_sse2; then
         lxqt_text="LXQt: moderno (Qt), necesita algo mas de memoria"
@@ -823,7 +923,12 @@ remove_other_inits() {
     else
         # Simulacion previa: si la operacion arrastrara cualquier paquete
         # que no sea de esos inits, no se hace nada.
-        extra="$(apt-get -s purge $pkgs 2>/dev/null \
+        # shellcheck disable=SC2086
+        if ! sim="$(LC_ALL=C apt-get -s purge $pkgs 2>>"$LOG_FILE")"; then
+            log_warn "apt no pudo simular el retiro de los otros inits: no se retira nada."
+            return 0
+        fi
+        extra="$(printf '%s\n' "$sim" \
                  | awk '/^(Remv|Purg) /{print $2}' | sed 's/:.*//' \
                  | grep -vE "$INIT_PKG_REGEX" || true)"
         if [ -n "$extra" ]; then
@@ -861,9 +966,13 @@ setup_session_tracking() {
     fi
 
     if is_installed elogind || is_installed libpam-elogind; then
-        extra="$(apt-get -s purge elogind libpam-elogind 2>/dev/null \
-                 | awk '/^(Remv|Purg) /{print $2}' | sed 's/:.*//' \
-                 | grep -vx -e elogind -e libpam-elogind || true)"
+        if ! sim="$(LC_ALL=C apt-get -s purge elogind libpam-elogind 2>>"$LOG_FILE")"; then
+            sim=""; extra="(apt no pudo simular la operacion)"
+        else
+            extra="$(printf '%s\n' "$sim" \
+                     | awk '/^(Remv|Purg) /{print $2}' | sed 's/:.*//' \
+                     | grep -vx -e elogind -e libpam-elogind || true)"
+        fi
         if [ -n "$extra" ]; then
             log_warn "No se retira elogind porque tambien eliminaria: $(echo $extra)"
         elif DEBIAN_FRONTEND=noninteractive apt-get purge -y elogind libpam-elogind >>"$LOG_FILE" 2>&1; then
@@ -902,6 +1011,12 @@ install_packages() {
     apt_install $PKGS_APPS
     # shellcheck disable=SC2086
     apt_install $PKGS_YOUTUBE
+    # El servicio de LightDM se instala al final (al instalarse, la pantalla
+    # cambia al inicio grafico). Se descarga ahora, mientras seguro hay
+    # internet: al final la red puede estar cambiando a NetworkManager.
+    # shellcheck disable=SC2086
+    DEBIAN_FRONTEND=noninteractive apt-get install -d $APT_INSTALL_OPTS runit-service-lightdm >>"$LOG_FILE" 2>&1 \
+        || log_warn "No se pudo descargar runit-service-lightdm por adelantado."
 
     # Si algo arrastro otro gestor de inicio de sesion, se desactiva: dos
     # gestores a la vez pelean por la pantalla.
@@ -997,14 +1112,23 @@ download_checked() {
 
 setup_youtube() {
     log_info "== YouTube ligero =="
-    tmp="$(mktemp -d)"
+    local tmp yt_url tag
+    command -v curl >/dev/null 2>&1 || { log_warn "No esta curl: no se instala YouTube ligero."; return 0; }
+    tmp="$(make_temp -d)"
     yt_alto=480
     [ "$(nproc 2>/dev/null || echo 2)" -gt 1 ] || yt_alto=360
 
     # yt-dlp oficial: el archivo "yt-dlp" funciona en 32 y 64 bits (Python).
     if [ ! -x /usr/local/bin/yt-dlp ]; then
-        if download_checked "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" "$tmp/yt-dlp" "" \
-           && download_checked "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS" "$tmp/sums" ""; then
+        # Primero se averigua cual es la ultima version y se bajan el programa
+        # y su lista de huellas de ESA version: si justo sale una nueva entre
+        # las dos descargas, no se mezclan.
+        yt_url="https://github.com/yt-dlp/yt-dlp/releases/latest/download"
+        tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/yt-dlp/yt-dlp/releases/latest 2>/dev/null)"
+        tag="${tag##*/}"
+        case "$tag" in [0-9]*.[0-9]*) yt_url="https://github.com/yt-dlp/yt-dlp/releases/download/$tag" ;; esac
+        if download_checked "$yt_url/yt-dlp" "$tmp/yt-dlp" "" \
+           && download_checked "$yt_url/SHA2-256SUMS" "$tmp/sums" ""; then
             want="$(awk '$2=="yt-dlp"{print $1}' "$tmp/sums")"
             if [ -n "$want" ] && [ "$(sha256sum "$tmp/yt-dlp" | cut -d' ' -f1)" = "$want" ]; then
                 install -m 755 "$tmp/yt-dlp" /usr/local/bin/yt-dlp
@@ -1122,6 +1246,8 @@ Keywords=youtube;video;videos;musica;pipe-viewer;
 DESKTOP
     for d in /usr/local/share/applications /usr/share/applications; do
         if [ -f "$d/gtk-pipe-viewer.desktop" ]; then
+            # Ya oculto (segunda ejecucion del script): no se repite la linea.
+            grep -qx 'NoDisplay=true' "$d/gtk-pipe-viewer.desktop" && break
             sed '/^\[Desktop Entry\]/a NoDisplay=true' "$d/gtk-pipe-viewer.desktop" \
                 > /usr/local/share/applications/gtk-pipe-viewer.desktop.tmp \
                 && mv /usr/local/share/applications/gtk-pipe-viewer.desktop.tmp /usr/local/share/applications/gtk-pipe-viewer.desktop
@@ -1180,12 +1306,18 @@ SYSCTL
             echo "THP=$thp"
             echo "SYSCTL_FILE=$TUNE_SYSCTL"
             cat <<'BOOT'
-# zram: swap comprimido del tamano de la RAM.
-if [ ! -e /dev/zram0 ] && modprobe zram num_devices=1 2>/dev/null; then
-    ram_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
-    zramctl /dev/zram0 --algorithm "$ZRAM_ALGO" --size "${ram_kb}KiB" 2>/dev/null \
-        || zramctl /dev/zram0 --size "${ram_kb}KiB" 2>/dev/null
-    mkswap /dev/zram0 >/dev/null 2>&1 && swapon -p 100 /dev/zram0 2>/dev/null
+# zram: swap comprimido del tamano de la RAM. Solo si todavia no hay un
+# zram como swap. Si el modulo ya estaba cargado (lo carga el kernel o
+# antix-memory-manager), /dev/zram0 existe pero vacio (tamano 0): se usa.
+# Un zram0 que ya tiene tamano lo esta usando otro programa: no se toca.
+if ! grep -q '^/dev/zram' /proc/swaps 2>/dev/null; then
+    [ -b /dev/zram0 ] || modprobe zram num_devices=1 2>/dev/null
+    if [ -b /dev/zram0 ] && [ "$(cat /sys/block/zram0/disksize 2>/dev/null)" = 0 ]; then
+        ram_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+        zramctl /dev/zram0 --algorithm "$ZRAM_ALGO" --size "${ram_kb}KiB" 2>/dev/null \
+            || zramctl /dev/zram0 --size "${ram_kb}KiB" 2>/dev/null
+        mkswap /dev/zram0 >/dev/null 2>&1 && swapon -p 100 /dev/zram0 2>/dev/null
+    fi
 fi
 # Planificador BFQ para discos mecanicos.
 modprobe bfq 2>/dev/null
@@ -1234,6 +1366,35 @@ setup_earlyoom() {
     [ "$TUNE" -eq 1 ] || return 0
     if is_installed earlyoom; then
         ensure_runit_service earlyoom "/usr/bin/earlyoom -r 3600" no
+    fi
+}
+
+# Las tareas semanales (actualizar yt-dlp, TRIM del SSD) van en
+# /etc/cron.weekly: las ejecuta cron, y anacron hace que corran aunque el
+# equipo no estuviera encendido justo ese dia. Si faltan, se instalan y
+# cron se activa como servicio de runit.
+ensure_scheduler() {
+    local pkgs=""
+    command -v cron >/dev/null 2>&1 || pkgs="cron"
+    command -v anacron >/dev/null 2>&1 || pkgs="$pkgs anacron"
+    if [ -n "$pkgs" ]; then
+        apt-cache show runit-service-cron >/dev/null 2>&1 && pkgs="$pkgs runit-service-cron"
+        # shellcheck disable=SC2086
+        apt_install $pkgs
+    fi
+    if command -v cron >/dev/null 2>&1; then
+        ensure_runit_service cron "$(command -v cron) -f" no
+    else
+        log_warn "No hay cron: las tareas semanales (yt-dlp, TRIM) no se ejecutaran."
+    fi
+}
+
+# En --limpiar (sin internet) solo se avisa.
+check_scheduler() {
+    if ! command -v cron >/dev/null 2>&1; then
+        log_warn "No hay cron: las tareas semanales (TRIM) no se ejecutaran. Con internet: sudo apt install cron anacron"
+    elif [ ! -e "$SERVICE_DIR/$(runit_name cron)" ]; then
+        ensure_runit_service cron "$(command -v cron) -f" no
     fi
 }
 
@@ -1289,7 +1450,7 @@ EOF
   [exec] (Escaner) {simple-scan}
   [exec] (Impresoras) {system-config-printer}
   [exec] (Bluetooth) {blueman-manager}
-  [exec] (Captura de pantalla) {scrot -e 'mv $f ~/'}
+  [exec] (Captura de pantalla) {scrot -d 1 ~/captura-%Y-%m-%d_%H%M%S.png}
   [exec] (Terminal) {lxterminal}
   [separator]
   [submenu] (Todos los programas)
@@ -1593,7 +1754,7 @@ final_report() {
     else
         log_ok "elogind no esta instalado."
     fi
-    for s in dbus seatd "$(runit_name "network-manager NetworkManager")" cups "$(runit_name "bluetooth bluetoothd")"; do
+    for s in dbus "$(runit_name consolekit)" "$(runit_name "network-manager NetworkManager")" cups "$(runit_name "bluetooth bluetoothd")"; do
         st="$(sv status "$SERVICE_DIR/$s" 2>/dev/null | cut -d: -f1)"
         if [ "$st" = "run" ]; then log_ok "Servicio '$s' corriendo."; else log_warn "Servicio '$s': ${st:-no activado}."; fi
     done
@@ -1635,11 +1796,24 @@ main_clean() {
     remove_other_inits
     clean_antix_full
     setup_tuning
-    # earlyoom no viene en la ISO: se instala solo si hay internet.
-    if [ "$TUNE" -eq 1 ] && ! is_installed earlyoom \
-       && timeout 60 apt-get install -y --no-install-recommends earlyoom >>"$LOG_FILE" 2>&1; then
-        log_ok "earlyoom instalado."
+    # earlyoom no viene en la ISO: se instala solo si hay internet. Se
+    # limita el tiempo de cada descarga (no el de apt entero): cortar apt
+    # mientras dpkg instala podria dejarlo a medio camino.
+    if [ "$TUNE" -eq 1 ] && ! is_installed earlyoom; then
+        net_opts="-o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=1"
+        # Sin la lista de paquetes (recien instalado) apt no conoce earlyoom.
+        # shellcheck disable=SC2086
+        apt-cache show earlyoom >/dev/null 2>&1 \
+            || apt-get $net_opts update >>"$LOG_FILE" 2>&1
+        # shellcheck disable=SC2086
+        if apt-cache show earlyoom >/dev/null 2>&1 \
+           && DEBIAN_FRONTEND=noninteractive apt-get $net_opts install $APT_INSTALL_OPTS earlyoom >>"$LOG_FILE" 2>&1; then
+            log_ok "earlyoom instalado."
+        else
+            log_info "earlyoom no se instalo (sin internet): se puede agregar despues con 'sudo apt install earlyoom'."
+        fi
     fi
+    check_scheduler
     setup_earlyoom
     log_info "Registro completo: $LOG_FILE"
     log_ok "Listo. Reinicia el equipo para terminar."
@@ -1648,17 +1822,22 @@ main_clean() {
 main() {
     parse_args "$@"
     check_environment
+    WORK_DIR="$(mktemp -d)"
+    trap 'rm -rf "$WORK_DIR"' EXIT
+    trap 'exit 130' INT TERM
+    # Primero se elige: si se cancela o se elige limpiar antiX Full (que no
+    # necesita internet), todavia no se toco apt.
+    choose_desktop
     if [ "$DESKTOP" = "LIMPIAR" ]; then
         main_clean
         return 0
     fi
     choose_fast_mirrors
-    log_info "Actualizando indices de paquetes..."
-    apt-get update >>"$LOG_FILE" 2>&1 || log_warn "apt-get update tuvo errores (detalle en $LOG_FILE)."
-    choose_desktop
-    if [ "$DESKTOP" = "LIMPIAR" ]; then
-        main_clean
-        return 0
+    if [ "$MIRRORS_UPDATED" = 1 ]; then
+        log_ok "Indices de paquetes al dia (se actualizaron al probar los espejos)."
+    else
+        log_info "Actualizando indices de paquetes..."
+        apt-get update >>"$LOG_FILE" 2>&1 || log_warn "apt-get update tuvo errores (detalle en $LOG_FILE)."
     fi
     remove_other_inits
     # zram antes de instalar: con 1 GB de RAM apt-get se puede quedar sin
@@ -1667,9 +1846,12 @@ main() {
     setup_session_tracking
     install_packages
     setup_earlyoom
+    ensure_scheduler
+    # YouTube ligero se descarga antes de pasar la red a NetworkManager: en
+    # ese cambio la conexion (sobre todo el wifi) se puede cortar un momento.
+    setup_youtube
     setup_network
     setup_services
-    setup_youtube
     setup_desktop_config
     setup_display_manager
     setup_user
