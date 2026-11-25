@@ -1723,6 +1723,47 @@ lxqt_volume_alsa() {
     log_ok "Control de volumen de LXQt con ALSA ($conf)"
 }
 
+# Apagar y reiniciar desde el escritorio. Sin elogind, el dialogo "Salir"
+# de LXQt pregunta a ConsoleKit si se puede apagar y este puede contestar
+# que no (los botones salen grises). Se deja un comando propio que apaga
+# con sudo (regla solo para poweroff/reboot, sin contrasena, grupo users)
+# y LXQt lo usa directamente.
+setup_power_buttons() {
+    local off reb rule=/etc/sudoers.d/antix-apagar tmp d
+    off="$(command -v poweroff 2>/dev/null || true)"
+    reb="$(command -v reboot 2>/dev/null || true)"
+    if [ -z "$off" ] || [ -z "$reb" ] || ! command -v sudo >/dev/null 2>&1; then
+        log_warn "No se encontro poweroff/reboot o sudo: el apagado queda como venia."
+        return 0
+    fi
+    cat > /usr/local/bin/antix-salir <<EOF
+#!/bin/sh
+# Apaga o reinicia el equipo (lo usa el dialogo Salir del escritorio).
+case "\$1" in
+    apagar)    exec sudo -n $off ;;
+    reiniciar) exec sudo -n $reb ;;
+    *) echo "Uso: antix-salir apagar|reiniciar" >&2; exit 2 ;;
+esac
+EOF
+    chmod 755 /usr/local/bin/antix-salir
+    tmp="$(make_temp)" || return 0
+    printf '# Apagar y reiniciar sin contrasena desde el escritorio (antix-desktop-postinstall).\n%%users ALL=(root) NOPASSWD: %s, %s\n' "$off" "$reb" > "$tmp"
+    if visudo -cqf "$tmp" >/dev/null 2>&1; then
+        install -m 440 "$tmp" "$rule"
+        log_ok "Apagar y reiniciar desde el escritorio sin contrasena (grupo users)."
+    else
+        log_warn "La regla de apagado no paso la revision de sudo; no se instalo."
+    fi
+    rm -f "$tmp"
+    if [ "$DESKTOP" = LXQT ]; then
+        for d in /etc/skel/.config/lxqt ${TARGET_HOME:+$TARGET_HOME/.config/lxqt}; do
+            mkdir -p "$d"
+            printf '[General]\nshutdownCommand=/usr/local/bin/antix-salir apagar\nrebootCommand=/usr/local/bin/antix-salir reiniciar\n' > "$d/power.conf"
+        done
+        log_ok "Botones Apagar y Reiniciar de LXQt activados."
+    fi
+}
+
 setup_desktop_config() {
     log_info "== Configuracion de $DESKTOP =="
 
@@ -1736,6 +1777,8 @@ setup_desktop_config() {
             remove_line "$f" "$l"
         done
     done
+
+    setup_power_buttons
 
     case "$DESKTOP" in
         LXDE)
@@ -1842,7 +1885,7 @@ setup_user() {
             log_warn "No se pudo crear el grupo 'bluetooth': $TARGET_USER podria necesitar permisos para Bluetooth."
         fi
     fi
-    for grp in netdev audio video plugdev lpadmin scanner bluetooth; do
+    for grp in users netdev audio video plugdev lpadmin scanner bluetooth; do
         if getent group "$grp" >/dev/null; then
             usermod -aG "$grp" "$TARGET_USER" && log_ok "Agregado al grupo '$grp'."
         fi
