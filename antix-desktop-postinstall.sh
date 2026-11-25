@@ -1682,6 +1682,42 @@ EOF
     fi
 }
 
+# El control de volumen de la barra de LXQt usa PulseAudio por defecto. El
+# script deja solo ALSA (el sonido basico, como antiX), asi que el icono
+# salia con una X roja aunque el sonido funcionara. Se cambia a ALSA en la
+# configuracion de la barra (se copia la de fabrica si todavia no hay una).
+lxqt_volume_alsa() {
+    local d="$1" conf="$1/panel.conf" tmp
+    [ -f "$conf" ] || { [ -f /etc/xdg/lxqt/panel.conf ] && cp /etc/xdg/lxqt/panel.conf "$conf"; }
+    [ -f "$conf" ] || return 0
+    if ! grep -qx 'type=volume' "$conf"; then
+        # Sin seccion propia: si la barra tiene el plugin "volume", se agrega.
+        grep -qE '^plugins=(.*[ ,])?volume([ ,]|$)' "$conf" || return 0
+        printf '\n[volume]\ntype=volume\naudioEngine=Alsa\n' >> "$conf"
+        log_ok "Control de volumen de LXQt con ALSA ($conf)"
+        return 0
+    fi
+    tmp="$(make_temp)" || return 0
+    # En la seccion cuyo "type" es volume: audioEngine=Alsa (cambia el valor
+    # si ya estaba, o lo agrega al final de la seccion).
+    awk '
+        function flush() {
+            if (n == 0) return
+            for (i = 1; i <= n; i++) {
+                if (isvol && buf[i] ~ /^audioEngine=/) { buf[i] = "audioEngine=Alsa"; done = 1 }
+                print buf[i]
+            }
+            if (isvol && !done) print "audioEngine=Alsa"
+            n = 0; isvol = 0; done = 0
+        }
+        /^\[/ { flush(); print; next }
+        { buf[++n] = $0; if ($0 == "type=volume") isvol = 1 }
+        END { flush() }
+    ' "$conf" > "$tmp" && cat "$tmp" > "$conf"
+    rm -f "$tmp"
+    log_ok "Control de volumen de LXQt con ALSA ($conf)"
+}
+
 setup_desktop_config() {
     log_info "== Configuracion de $DESKTOP =="
 
@@ -1718,6 +1754,7 @@ EOF
                     printf '[General]\nwindow_manager=openbox\n' > "$d/session.conf"
                     log_ok "Gestor de ventanas de LXQt: Openbox ($d)"
                 fi
+                lxqt_volume_alsa "$d"
             done
             ;;
         FLUXBOX)
