@@ -160,8 +160,9 @@ apt_install() {
     # instalarse; si runit todavia no lo vio (lo revisa cada 5 s), el paquete
     # falla con "unable to open supervise/ok" aunque todo quedo bien. Se
     # espera un momento y se termina de configurar lo que quedo pendiente.
-    sleep 6
-    if DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 \
+    if tail -n 300 "$LOG_FILE" 2>/dev/null | grep -q 'unable to open supervise/ok' \
+       && sleep 6 \
+       && DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 \
        && apt_get_install "$@"; then
         log_ok "Instalado (al segundo intento)."
         return 0
@@ -1437,20 +1438,26 @@ ensure_scheduler() {
         apt-cache show runit-service-cron >/dev/null 2>&1 && pkgs="$pkgs runit-service-cron"
         # shellcheck disable=SC2086
         apt_install $pkgs
-        # El paquete cron arranca su propio cron (a la antigua) y luego runit
-        # arranca otro, que no puede iniciar porque ya hay uno y se reinicia
-        # cada segundo. Se detiene el primero; runit deja el suyo.
-        if [ -x /etc/init.d/cron ] && [ -e "$SERVICE_DIR/cron" ]; then
-            /etc/init.d/cron stop >>"$LOG_FILE" 2>&1
-            sv restart "$SERVICE_DIR/cron" >/dev/null 2>&1
-        fi
     fi
     if command -v cron >/dev/null 2>&1; then
         ensure_runit_service cron "$(command -v cron) -f" no
+        cron_only_runit
         setup_anacron_cron
     else
         log_warn "No hay cron: las tareas semanales (yt-dlp, TRIM) no se ejecutaran."
     fi
+}
+
+# El paquete cron arranca su propio cron (a la antigua, /etc/init.d) y
+# luego runit arranca otro, que no puede iniciar porque ya hay uno y se
+# reinicia cada segundo. Se detiene el de /etc/init.d y runit deja el suyo.
+cron_only_runit() {
+    local name
+    name="$(runit_name cron)"
+    [ -x /etc/init.d/cron ] && [ -e "$SERVICE_DIR/$name" ] || return 0
+    /etc/init.d/cron stop >>"$LOG_FILE" 2>&1
+    sv restart "$SERVICE_DIR/$name" >/dev/null 2>&1
+    return 0
 }
 
 # Debian arranca anacron al encender con un script de init y, ademas, cada
@@ -1481,6 +1488,7 @@ check_scheduler() {
         log_warn "No hay cron: las tareas semanales (TRIM) no se ejecutaran. Con internet: sudo apt install cron anacron"
     else
         [ -e "$SERVICE_DIR/$(runit_name cron)" ] || ensure_runit_service cron "$(command -v cron) -f" no
+        cron_only_runit
         if [ -x /usr/sbin/anacron ]; then
             setup_anacron_cron
         else
@@ -1786,7 +1794,11 @@ setup_user() {
     # El paquete bluez de antiX 26 no logra crear su grupo ("groupadd:
     # identificador de grupo incorrecto"): se crea aqui.
     if is_installed bluez && ! getent group bluetooth >/dev/null; then
-        groupadd -r bluetooth && log_ok "Grupo 'bluetooth' creado (bluez no lo creo)."
+        if groupadd -r bluetooth; then
+            log_ok "Grupo 'bluetooth' creado (bluez no lo creo)."
+        else
+            log_warn "No se pudo crear el grupo 'bluetooth': $TARGET_USER podria necesitar permisos para Bluetooth."
+        fi
     fi
     for grp in netdev audio video plugdev lpadmin scanner bluetooth; do
         if getent group "$grp" >/dev/null; then
