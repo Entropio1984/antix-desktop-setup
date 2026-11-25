@@ -43,6 +43,15 @@ jobs:
             printf "a\n@lxpolkit\nb\n" > tres; remove_line tres @lxpolkit
             test "$(cat tres)" = "$(printf "a\nb")" || { echo "::error::remove_line"; exit 1; }
             ls tres.tmp 2>/dev/null && { echo "::error::quedo un temporal junto al archivo"; exit 1; }
+            # Tres lineas quitadas en el mismo segundo: el respaldo es el original.
+            printf "@nm-applet\n@volumeicon\n@lxpolkit\nx\n" > auto
+            for l in @nm-applet @volumeicon @lxpolkit; do remove_line auto "$l"; done
+            test "$(cat auto)" = x || { echo "::error::remove_line en serie"; exit 1; }
+            primero="$(ls auto.bak.* | sort | head -n1)"
+            printf "@nm-applet\n@volumeicon\n@lxpolkit\nx\n" | cmp - "$primero" || { echo "::error::el respaldo no es el original"; exit 1; }
+            # Un enlace no se sigue.
+            echo "@lxpolkit" > destino; ln -s destino enlace; remove_line enlace @lxpolkit
+            grep -qx @lxpolkit destino || { echo "::error::remove_line siguio un enlace"; exit 1; }
             # Un espejo que contesta 404 no da tiempo.
             test -z "$(mirror_latency https://deb.debian.org/debian/no-existe)" || { echo "::error::mirror_latency acepto un 404"; exit 1; }
             test -n "$(mirror_latency https://deb.debian.org/debian/README)" || { echo "::error::mirror_latency"; exit 1; }
