@@ -377,7 +377,10 @@ apt_source_files() {
 # "sort -n" ordenaria mal "0.25".
 mirror_latency() {
     local out
-    if out="$(LC_ALL=C curl -fsSL -o /dev/null --connect-timeout 3 --max-time 6 -w '%{time_total}' "$1" 2>/dev/null)"; then
+    # Solo los primeros 16 KB: para Debian se prueba con Packages.xz (unos
+    # 10 MB); bajarlo entero de 11 espejos a la vez agotaba el tiempo en
+    # conexiones normales y no se media ninguno.
+    if out="$(LC_ALL=C curl -fsSL -r 0-16383 -o /dev/null --connect-timeout 3 --max-time 6 -w '%{time_total}' "$1" 2>/dev/null)"; then
         printf '%s\n' "$out"
     fi
 }
@@ -487,6 +490,9 @@ EOF_DEB
     read -r ax_cur ax_suite <<EOF_AX
 $(apt_line_url "$ax_file" '^https?://')
 EOF_AX
+    # Sin la barra final (".../antix/trixie/"): si no, la busqueda de
+    # espejos de antiX se saltaba sin aviso.
+    ax_cur="${ax_cur%/}"
     if [ -n "${ax_cur:-}" ] && [ -n "${ax_suite:-}" ] && [ "${ax_cur%/$ax_suite}" != "$ax_cur" ]; then
         ax_cands="${ax_cur%/$ax_suite}"
         if [ -r /usr/sbin/localize-repo ]; then
