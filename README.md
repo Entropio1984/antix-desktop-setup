@@ -26,7 +26,7 @@ No instala nada más: se omiten los paquetes "recomendados" que apt agregaría p
 | Escritorio | Para qué equipo | Notas |
 | --- | --- | --- |
 | **LXDE** (recomendado) | Casi cualquiera, desde 1 GB de memoria | Sencillo, con barra de tareas y menú de inicio parecidos a Windows. |
-| **Fluxbox** | Muy viejo o con poca memoria (512 MB) | El más liviano. Trae una barra inferior al estilo de MX Linux (botón Menú, ventanas abiertas, wifi, volumen y reloj) con tema oscuro. El menú también aparece con clic derecho sobre el fondo de pantalla. |
+| **Fluxbox** | Muy viejo o con poca memoria (512 MB) | El más liviano. Trae una barra inferior al estilo de MX Linux (botón Menú, ventanas abiertas, wifi, volumen y reloj) con tema oscuro. El menú también aparece con clic derecho sobre el fondo de pantalla. "Captura de pantalla" espera un segundo (para que no salga el menú) y guarda la imagen en tu carpeta personal como `captura-fecha.png`. |
 | **LXQt** | Con 2 GB de memoria o más | El más moderno. No funciona en procesadores sin SSE2 (ver abajo). |
 
 ## Cómo usarlo
@@ -41,7 +41,7 @@ chmod +x antix-desktop-postinstall.sh
 sudo ./antix-desktop-postinstall.sh
 ```
 
-4. Elige el escritorio en el menú y confirma. El script ya no hace más preguntas; tarda entre 15 minutos y una hora, según el equipo y el internet.
+4. Elige el escritorio en el menú y confirma. El menú aparece antes de tocar nada: si eliges **Salir**, el sistema queda como estaba. Después de confirmar, el script ya no hace más preguntas; tarda entre 15 minutos y una hora, según el equipo y el internet.
 5. Al terminar, reinicia con `sudo reboot`.
 
 También se puede elegir el escritorio sin menú:
@@ -112,6 +112,8 @@ Son los mismos ajustes que usa Lázaro Linux, adaptados a antiX. El script los a
 | **TRIM semanal** (solo discos SSD) | Evita que un SSD se vuelva lento con el tiempo. |
 | **Páginas de memoria a pedido** (4 GB o menos) | Ahorra memoria. |
 
+Las tareas semanales (TRIM y la actualización de yt-dlp para YouTube ligero) las ejecuta **cron**, el programa que corre tareas programadas, junto con **anacron**, que las pone al día si el equipo estaba apagado ese día. Si antiX no los trae, el script los instala y deja cron funcionando.
+
 zram se activa **antes** de instalar el escritorio. En un equipo de 32 bits con poca memoria, apt-get se quedó sin memoria al calcular los ~650 paquetes de una sola vez y el sistema lo cerró. Por eso ahora también instala en cuatro tandas: base, escritorio, programas y YouTube.
 
 Si no los quieres, usa `--sin-ajustes`. Para quitarlos después, borra `/etc/sysctl.d/90-antix-equipos-viejos.conf` y `/etc/runit/boot-run/S76-antix-equipos-viejos.stage1.sh`, y reinicia.
@@ -137,6 +139,7 @@ grep -qw sse2 /proc/cpuinfo && echo "Tiene SSE2" || echo "NO tiene SSE2"
 - **Red:** NetworkManager reemplaza a dhcpcd y a connman. Solo se retiran cuando NetworkManager ya lleva 15 segundos funcionando, para que el equipo nunca quede sin internet. Si usabas wifi configurado con `ceni`, vuelve a conectarte desde el icono de red.
 - **Sesiones y permisos:** usa ConsoleKit en lugar de elogind. Con elogind bajo runit, cada inicio de sesión esperaba 25 segundos de más.
 - **Respaldos:** antes de modificar un archivo del sistema, guarda una copia con la fecha (`archivo.bak.AAAAMMDD_HHMMSS`).
+- **YouTube ligero antes de cambiar la red:** los programas de YouTube ligero se descargan antes de pasar la red a NetworkManager, porque en ese cambio el wifi se puede cortar un momento. El último paquete que se instala (el inicio gráfico) también se descarga por adelantado.
 - **Versión anterior:** si antes usaste el script viejo (`instalar_lxde_antix.sh`), este limpia lo que dejó mal: la sesión forzada a LXDE, el servicio roto de elogind, la consola de texto 1 desactivada y los iconos repetidos.
 
 ## Si algo sale mal

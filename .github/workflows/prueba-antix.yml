@@ -18,6 +18,10 @@ on:
 env:
   ANTIX_VERSION: "26.1"
 
+# La prueba solo lee el repositorio.
+permissions:
+  contents: read
+
 jobs:
   revisar-script:
     name: Revisar el script (ShellCheck)
@@ -26,6 +30,27 @@ jobs:
       - uses: actions/checkout@v4
       - run: bash -n antix-desktop-postinstall.sh
       - run: shellcheck -S warning antix-desktop-postinstall.sh
+      - name: Funciones pequenas (sin antiX)
+        run: |
+          cd "$RUNNER_TEMP"
+          ANTIX_SOLO_FUNCIONES=1 bash -c '
+            set -e
+            . "$GITHUB_WORKSPACE/antix-desktop-postinstall.sh"
+            LOG_FILE="$PWD/prueba.log"
+            # Archivo con una sola linea: debe quedar vacio.
+            printf "@nm-applet\n" > uno; remove_line uno @nm-applet
+            test ! -s uno || { echo "::error::remove_line no vacio el archivo de una linea"; exit 1; }
+            printf "a\n@lxpolkit\nb\n" > tres; remove_line tres @lxpolkit
+            test "$(cat tres)" = "$(printf "a\nb")" || { echo "::error::remove_line"; exit 1; }
+            ls tres.tmp 2>/dev/null && { echo "::error::quedo un temporal junto al archivo"; exit 1; }
+            # Un espejo que contesta 404 no da tiempo.
+            test -z "$(mirror_latency https://deb.debian.org/debian/no-existe)" || { echo "::error::mirror_latency acepto un 404"; exit 1; }
+            test -n "$(mirror_latency https://deb.debian.org/debian/README)" || { echo "::error::mirror_latency"; exit 1; }
+            # En espanol (coma decimal) la velocidad sigue siendo un numero.
+            v="$(LANG=es_CO.UTF-8 LC_ALL= mirror_speed http://deb.debian.org/debian/README)"
+            case "$v" in ""|*[!0-9]*) echo "::error::mirror_speed dio [$v]"; exit 1 ;; esac
+            echo "OK"'
+          bash "$GITHUB_WORKSPACE/antix-desktop-postinstall.sh" --help | grep -q "Es idempotente" || { echo "::error::--help corta el final"; exit 1; }
 
   antix:
     name: antiX ${{ matrix.arch }} + ${{ matrix.escritorio }}
@@ -94,6 +119,10 @@ jobs:
         run: |
           sudo chroot /antix apt-cache search --names-only '^runit-service-' | sort
           sudo chroot /antix apt-cache show cups bluez | grep -E '^(Package|Version|Depends|Recommends|Suggests):'
+          echo "--- cron y anacron (para las tareas semanales):"
+          sudo chroot /antix dpkg-query -W -f='${Package} ${Status}\n' cron anacron 2>&1 || true
+          sudo chroot /antix apt-cache policy cron anacron runit-service-cron | grep -E '^[a-z]|Candidate|Candidato' || true
+          ls -d /antix/etc/sv/cron* 2>/dev/null || echo "antiX no trae servicio de runit para cron"
 
       - name: Retirar los otros inits (solo queda runit)
         run: |
