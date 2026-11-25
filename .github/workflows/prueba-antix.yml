@@ -227,6 +227,7 @@ jobs:
         run: |
           sudo chroot /antix env ANTIX_SOLO_FUNCIONES=1 bash -c '. /root/antix-desktop-postinstall.sh; LOG_FILE=/tmp/lxqt.log; DESKTOP=LXQT; TARGET_HOME=""; TARGET_USER=""; setup_desktop_config'
           sudo cat /antix/tmp/lxqt.log
+          sudo chroot /antix dpkg -L lxqt-panel | grep -E "panel\.conf$" || true
           echo "--- panel.conf de /etc/skel:"; sudo cat /antix/etc/skel/.config/lxqt/panel.conf
           sudo grep -qx 'audioEngine=Alsa' /antix/etc/skel/.config/lxqt/panel.conf || { echo "::error::El volumen de LXQt no quedo con ALSA"; exit 1; }
 

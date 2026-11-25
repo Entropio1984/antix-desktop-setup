@@ -1687,9 +1687,14 @@ EOF
 # salia con una X roja aunque el sonido funcionara. Se cambia a ALSA en la
 # configuracion de la barra (se copia la de fabrica si todavia no hay una).
 lxqt_volume_alsa() {
-    local d="$1" conf="$1/panel.conf" tmp
-    [ -f "$conf" ] || { [ -f /etc/xdg/lxqt/panel.conf ] && cp /etc/xdg/lxqt/panel.conf "$conf"; }
-    [ -f "$conf" ] || return 0
+    local d="$1" conf="$1/panel.conf" tmp src
+    # La de fabrica esta en /usr/share/lxqt (Debian/antiX) o en /etc/xdg/lxqt.
+    if [ ! -f "$conf" ]; then
+        for src in /etc/xdg/lxqt/panel.conf /usr/share/lxqt/panel.conf; do
+            [ -f "$src" ] && { cp "$src" "$conf"; break; }
+        done
+    fi
+    [ -f "$conf" ] || { log_warn "No se encontro la configuracion de la barra de LXQt; el volumen queda como venia."; return 0; }
     if ! grep -qx 'type=volume' "$conf"; then
         # Sin seccion propia: si la barra tiene el plugin "volume", se agrega.
         grep -qE '^plugins=(.*[ ,])?volume([ ,]|$)' "$conf" || return 0
