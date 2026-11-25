@@ -156,6 +156,16 @@ apt_install() {
         log_ok "Instalado."
         return 0
     fi
+    # Los paquetes runit-service-* de antiX arrancan su servicio al
+    # instalarse; si runit todavia no lo vio (lo revisa cada 5 s), el paquete
+    # falla con "unable to open supervise/ok" aunque todo quedo bien. Se
+    # espera un momento y se termina de configurar lo que quedo pendiente.
+    sleep 6
+    if DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 \
+       && apt_get_install "$@"; then
+        log_ok "Instalado (al segundo intento)."
+        return 0
+    fi
     for p in "$@"; do
         if apt-cache show "$p" >/dev/null 2>&1; then known="$known $p"; else unknown="$unknown $p"; fi
     done
@@ -499,16 +509,18 @@ EOF_AX
             ax_cands="$ax_cands $(sed -n 's/^[a-z0-9_]*_AX_HOST=//p' /usr/sbin/localize-repo | tr -d '"' | awk '{print $1}')"
         fi
         ax_cur_base="${ax_cur%/$ax_suite}"
+        # Igual que con Debian: primero los que responden rapido y, de esos 4,
+        # el que baja mas rapido. Medir solo la respuesta llego a elegir un
+        # espejo de Alemania que contestaba rapido pero bajaba a 20 KB/s.
         best="$(for b in $(echo $ax_cands | tr ' ' '\n' | sed 's#/$##' | awk 'NF && !v[$0]++'); do
-                    echo "$b $b/$ax_suite/dists/$ax_suite/Release"
-                done | pick_mirror latencia)"
-        cur_t="$(mirror_latency "$ax_cur/dists/$ax_suite/Release")"
-        best_base="${best% *}"; best_t="${best#* }"
+                    echo "$b $b/$ax_suite/dists/$ax_suite/main/binary-$arch/Packages.xz"
+                done | pick_mirror velocidad)"
+        cur_speed="$(mirror_speed "$ax_cur/dists/$ax_suite/main/binary-$arch/Packages.xz")"
+        best_base="${best% *}"; best_speed="${best#* }"
         if [ -z "$best" ]; then
             log_warn "No se pudo medir ningun espejo de antiX: se deja $ax_cur."
-        elif [ "$best_base" != "$ax_cur_base" ] && \
-             { [ -z "$cur_t" ] || LC_ALL=C awk -v n="$best_t" -v a="$cur_t" 'BEGIN { exit !(n < a * 0.8) }'; }; then
-            log_ok "antiX: $best_base/$ax_suite (${best_t} s) en lugar de $ax_cur (${cur_t:-sin respuesta} s)."
+        elif [ "$best_base" != "$ax_cur_base" ] && [ "$best_speed" -gt $((cur_speed * 12 / 10)) ]; then
+            log_ok "antiX: $best_base/$ax_suite ($best_speed KB/s) en lugar de $ax_cur ($cur_speed KB/s)."
             replace_apt_url "$ax_cur" "$best_base/$ax_suite"
             changed=1
         else
@@ -951,10 +963,29 @@ remove_other_inits() {
             log_warn "No se retiran los otros inits porque tambien se eliminaria: $(echo $extra)"
             return 0
         fi
-        if DEBIAN_FRONTEND=noninteractive apt-get purge -y $pkgs >>"$LOG_FILE" 2>&1; then
+        # Primero los servicios de cada init, mientras sus herramientas
+        # (s6-rc, 66, dinit) siguen instaladas: en antiX 26 el script de
+        # purga de s6-rc-service-dbus y s6-rc-service-dhcpcd falla si s6-rc
+        # ya no esta.
+        svc="$(printf '%s\n' $pkgs | grep -E -- '-service-' || true)"
+        if [ -n "$svc" ]; then
+            # shellcheck disable=SC2086
+            DEBIAN_FRONTEND=noninteractive apt-get purge -y $svc >>"$LOG_FILE" 2>&1 \
+                || log_warn "Algunos servicios de los otros inits no se pudieron purgar (detalle en $LOG_FILE)."
+        fi
+        rest="$(dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null \
+                | awk '$NF=="installed"{print $1}' | grep -E "$INIT_PKG_REGEX" || true)"
+        # shellcheck disable=SC2086
+        if [ -z "$rest" ] || DEBIAN_FRONTEND=noninteractive apt-get purge -y $rest >>"$LOG_FILE" 2>&1; then
             log_ok "Retirados: $(echo $pkgs)"
         else
-            log_warn "No se pudieron retirar los otros inits (detalle en $LOG_FILE)."
+            log_warn "Hubo errores al retirar los otros inits (detalle en $LOG_FILE)."
+        fi
+        # Lo que importa es que no quede ningun otro init: si quedan solo
+        # restos de configuracion (estado "rc"), igual se arregla GRUB.
+        if dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null | awk '$NF=="installed"{print $1}' \
+           | grep -qE '^(sysvinit|dinit|s6-rc|s6-66)-init-antix$'; then
+            log_warn "Sigue instalado otro init: no se toca GRUB."
             return 0
         fi
     fi
@@ -997,10 +1028,16 @@ setup_session_tracking() {
             log_warn "No se pudo retirar elogind (detalle en $LOG_FILE)."
         fi
     fi
-    # libelogind0 es una LIBRERIA que necesitan muchos paquetes: se marca
-    # como instalada a mano para que 'apt autoremove' no la borre.
+    protect_elogind_libs
+}
+
+# libelogind0 es una LIBRERIA que necesitan muchos paquetes: se marca
+# como instalada a mano para que 'apt autoremove' no la borre. Se llama
+# tambien despues de instalar, porque suele llegar con los programas.
+protect_elogind_libs() {
+    local lib
     for lib in libelogind0 libelogind-compat; do
-        if is_installed "$lib"; then
+        if is_installed "$lib" && apt-mark showauto "$lib" 2>/dev/null | grep -qx "$lib"; then
             apt-mark manual "$lib" >>"$LOG_FILE" 2>&1 && log_ok "'$lib' protegida de 'apt autoremove'."
         fi
     done
@@ -1400,6 +1437,13 @@ ensure_scheduler() {
         apt-cache show runit-service-cron >/dev/null 2>&1 && pkgs="$pkgs runit-service-cron"
         # shellcheck disable=SC2086
         apt_install $pkgs
+        # El paquete cron arranca su propio cron (a la antigua) y luego runit
+        # arranca otro, que no puede iniciar porque ya hay uno y se reinicia
+        # cada segundo. Se detiene el primero; runit deja el suyo.
+        if [ -x /etc/init.d/cron ] && [ -e "$SERVICE_DIR/cron" ]; then
+            /etc/init.d/cron stop >>"$LOG_FILE" 2>&1
+            sv restart "$SERVICE_DIR/cron" >/dev/null 2>&1
+        fi
     fi
     if command -v cron >/dev/null 2>&1; then
         ensure_runit_service cron "$(command -v cron) -f" no
@@ -1739,6 +1783,11 @@ setup_user() {
 
     [ -n "$TARGET_USER" ] || return 0
     log_info "== Ajustes del usuario $TARGET_USER =="
+    # El paquete bluez de antiX 26 no logra crear su grupo ("groupadd:
+    # identificador de grupo incorrecto"): se crea aqui.
+    if is_installed bluez && ! getent group bluetooth >/dev/null; then
+        groupadd -r bluetooth && log_ok "Grupo 'bluetooth' creado (bluez no lo creo)."
+    fi
     for grp in netdev audio video plugdev lpadmin scanner bluetooth; do
         if getent group "$grp" >/dev/null; then
             usermod -aG "$grp" "$TARGET_USER" && log_ok "Agregado al grupo '$grp'."
@@ -1889,6 +1938,7 @@ main() {
     setup_tuning
     setup_session_tracking
     install_packages
+    protect_elogind_libs
     setup_earlyoom
     ensure_scheduler
     # YouTube ligero se descarga antes de pasar la red a NetworkManager: en
